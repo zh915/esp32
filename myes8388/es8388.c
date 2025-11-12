@@ -1,665 +1,294 @@
-/*
- * ESPRESSIF MIT 许可证
+/**
+ ****************************************************************************************************
+ * @file        es8388.c
+ * @author      正点原子团队(ALIENTEK)
+ * @version     V1.0
+ * @date        2025-01-01
+ * @brief       ES8388驱动代码
+ * @license     Copyright (c) 2020-2032, 广州市星翼电子科技有限公司
+ ****************************************************************************************************
+ * @attention
  *
- * 版权所有 (c) 2018 <ESPRESSIF SYSTEMS (SHANGHAI) PTE LTD>
+ * 实验平台:正点原子 ESP32-S3 开发板
+ * 在线视频:www.yuanzige.com
+ * 技术论坛:www.openedv.com
+ * 公司网址:www.alientek.com
+ * 购买地址:openedv.taobao.com
  *
- * 特此授予在所有 ESPRESSIF 系统产品上使用的许可，在这种情况下，
- * 任何获得本软件及相关文档文件（以下简称"软件"）副本的人，都可以免费无限制地处理本软件，
- * 包括但不限于使用、复制、修改、合并、出版、发行、再许可和/或出售软件副本，
- * 以及允许获得软件的人这样做，但须遵守以下条件：
- *
- * 上述版权声明和本许可声明应包含在软件的所有副本或重要部分中。
- *
- * 本软件按"原样"提供，不提供任何形式的保证，无论是明示的还是暗示的，
- * 包括但不限于适销性、特定用途适用性和非侵权性的保证。在任何情况下，
- * 作者或版权持有人均不对任何索赔、损害或其他责任负责，无论是在合同诉讼、侵权行为或其他方面，
- * 无论是由于使用或与软件的使用或其他交易有关。
- *
+ ****************************************************************************************************
  */
 
-#include <string.h>
-#include "esp_log.h"
-#include "i2c_bus.h"
 #include "es8388.h"
-#include "board.h"
-#include "audio_volume.h"
-#include "esp_err.h"
-#include "driver/i2c_master.h"
 
-#ifdef CONFIG_ESP_LYRAT_V4_3_BOARD
-#include "headphone_detect.h"
-#endif
 
-static const char *ES_TAG = "ES8388_DRIVER";  // ES8388驱动的日志标签
-static i2c_bus_handle_t i2c_handle;          // I2C总线句柄
-static codec_dac_volume_config_t *dac_vol_handle;  // DAC音量配置句柄
+const char* es8388_tag = "es8388";
+i2c_master_dev_handle_t es8388_handle = NULL;
 
-// DAC音量配置默认值
-#define ES8388_DAC_VOL_CFG_DEFAULT() {                      \
-    .max_dac_volume = 0,                                    \
-    .min_dac_volume = -96,                                  \
-    .board_pa_gain = BOARD_PA_GAIN,                         \
-    .volume_accuracy = 0.5,                                 \
-    .dac_vol_symbol = -1,                                   \
-    .zero_volume_reg = 0,                                   \
-    .reg_value = 0,                                         \
-    .user_volume = 0,                                       \
-    .offset_conv_volume = NULL,                             \
-}
-
-// 自定义断言宏，用于错误处理
-#define ES_ASSERT(a, format, b, ...) \
-    if ((a) != 0) { \
-        ESP_LOGE(ES_TAG, format, ##__VA_ARGS__); \
-        return b;\
+/**
+ * @brief       ES8388写寄存器
+ * @param       reg_addr:寄存器地址
+ * @param       data:写入的数据
+ * @retval      无
+ */
+esp_err_t es8388_write_reg(uint8_t reg_addr, uint8_t data)
+{
+    esp_err_t ret;
+    uint8_t *buf = malloc(2);
+    if (buf == NULL)
+    {
+        ESP_LOGE(es8388_tag, "%s memory failed", __func__);
+        return ESP_ERR_NO_MEM;      /* 分配内存失败 */
     }
 
-// ES8388编解码器的默认函数句柄
-audio_hal_func_t AUDIO_CODEC_ES8388_DEFAULT_HANDLE = {
-    .audio_codec_initialize = es8388_init,               // 初始化函数
-    .audio_codec_deinitialize = es8388_deinit,           // 反初始化函数
-    .audio_codec_ctrl = es8388_ctrl_state,               // 状态控制函数
-    .audio_codec_config_iface = es8388_config_i2s,       // I2S接口配置函数
-    .audio_codec_set_mute = es8388_set_voice_mute,       // 静音设置函数
-    .audio_codec_set_volume = es8388_set_voice_volume,   // 音量设置函数
-    .audio_codec_get_volume = es8388_get_voice_volume,   // 音量获取函数
-    .audio_codec_enable_pa = es8388_pa_power,            // 功率放大器控制函数
-    .audio_hal_lock = NULL,                              // 锁函数
-    .handle = NULL,                                      // 句柄
-};
+    buf[0] = reg_addr;              
+    buf[1] = data;                  /* 拷贝数据至存储区当中 */
 
-/**
- * @brief 向ES8388寄存器写入数据
- * 
- * @param slave_addr 从设备地址
- * @param reg_add 寄存器地址
- * @param data 要写入的数据
- * @return esp_err_t 操作结果
- */
-static esp_err_t es_write_reg(uint8_t slave_addr, uint8_t reg_add, uint8_t data)
-{
-    return i2c_bus_write_bytes(i2c_handle, slave_addr, &reg_add, sizeof(reg_add), &data, sizeof(data));
+    do 
+    {
+        i2c_master_bus_wait_all_done(bus_handle, 1000);
+        ret = i2c_master_transmit(es8388_handle, buf, 2, 1000);   
+    } while (ret != ESP_OK);
+
+    free(buf);                      /* 发送完成释放内存 */
+
+    return ret;
 }
 
 /**
- * @brief 从ES8388寄存器读取数据
- * 
- * @param reg_add 寄存器地址
- * @param p_data 存储读取数据的指针
- * @return esp_err_t 操作结果
+ * @brief       ES8388读寄存器
+ * @param       reg_add:寄存器地址
+ * @param       p_data:读取的数据
+ * @retval      无
  */
-static esp_err_t es_read_reg(uint8_t reg_add, uint8_t *p_data)
+esp_err_t es8388_read_reg(uint8_t reg_addr, uint8_t *pdata)
 {
-    return i2c_bus_read_bytes(i2c_handle, ES8388_ADDR, &reg_add, sizeof(reg_add), p_data, 1);
+    uint8_t reg_data = 0;
+    i2c_master_transmit_receive(es8388_handle, &reg_addr, 1, &reg_data, 1, -1);
+    return reg_data;
 }
 
-// /**
-//  * @brief 初始化I2C总线
-//  * 
-//  * @return esp_err_t 操作结果
-//  */
-// esp_err_t i2c_init(void)
-// {
-//     i2c_master_bus_config_t i2c_bus_config = {
-//         .clk_source                     = I2C_CLK_SRC_DEFAULT,  /* 时钟源 */
-//         .i2c_port                       = I2C_NUM_0,         /* I2C端口 */
-//         .scl_io_num                     = GPIO_NUM_40,     /* SCL管脚 */
-//         .sda_io_num                     = GPIO_NUM_41,     /* SDA管脚 */
-//         .glitch_ignore_cnt              = 7,                    /* 故障周期 */
-//         .flags.enable_internal_pullup   = true,                 /* 内部上拉 */
-//     };
-//     /* 新建I2C总线 */
-//     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, &bus_handle));
-
-//     return ESP_OK;
-// }
-
-
-static int i2c_init()
+/**
+ * @brief       ES8388初始化
+ * @param       无
+ * @retval      0,初始化正常
+ *              其他,错误代码
+ */
+uint8_t es8388_init(void)
 {
-    int res;
-    i2c_config_t es_i2c_cfg = {
-        .mode = I2C_MODE_MASTER,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 100000
+    uint8_t ret_val = 0;
+
+    /* 未调用myiic_init初始化IIC */
+    if (bus_handle == NULL)
+    {
+        ESP_ERROR_CHECK(myiic_init());
+    }
+
+    i2c_device_config_t es8388_i2c_dev_conf = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,  /* 从机地址长度 */
+        .scl_speed_hz    = IIC_SPEED_CLK,       /* 传输速率 */
+        .device_address  = ES8388_ADDR,         /* 从机7位的地址 */
     };
-    res = get_i2c_pins(I2C_NUM_0, &es_i2c_cfg);
-    ES_ASSERT(res, "getting i2c pins error", -1);
-    i2c_handle = i2c_bus_create(I2C_NUM_0, &es_i2c_cfg);
-    return res;
-}
+    /* I2C总线上添加ES8388设备 */
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &es8388_i2c_dev_conf, &es8388_handle));
+    ESP_ERROR_CHECK(i2c_master_bus_wait_all_done(bus_handle,1000));
 
+    ret_val |= es8388_write_reg(0, 0x80);       /* 软复位ES8388 */
+    ret_val |= es8388_write_reg(0, 0x00);
+    vTaskDelay(pdMS_TO_TICKS(200));             /* 等待复位 */
 
-/**
- * @brief 读取所有ES8388寄存器的值并打印
- */
-void es8388_read_all()
-{
-    for (int i = 0; i < 50; i++) {
-        uint8_t reg = 0;
-        es_read_reg(i, &reg);
-        ESP_LOGI(ES_TAG, "%x: %x", i, reg);
+    ret_val |= es8388_write_reg(0x01, 0x58);
+    ret_val |= es8388_write_reg(0x01, 0x50);
+    ret_val |= es8388_write_reg(0x02, 0xF3);
+    ret_val |= es8388_write_reg(0x02, 0xF0);
+
+    ret_val |= es8388_write_reg(0x03, 0x09);    /* 麦克风偏置电源关闭 */
+    ret_val |= es8388_write_reg(0x00, 0x06);    /* 使能参考 500K驱动使能 */
+    ret_val |= es8388_write_reg(0x04, 0x00);    /* DAC电源管理，不打开任何通道 */
+    ret_val |= es8388_write_reg(0x08, 0x00);    /* MCLK不分频 */
+    ret_val |= es8388_write_reg(0x2B, 0x80);    /* DAC控制 DACLRC与ADCLRC相同 */
+
+    ret_val |= es8388_write_reg(0x09, 0x88);    /* ADC L/R PGA增益配置为+24dB */
+    ret_val |= es8388_write_reg(0x0C, 0x4C);    /* ADC数据选择为left data = left ADC, right data = left ADC  音频数据为16bit */
+    ret_val |= es8388_write_reg(0x0D, 0x02);    /* ADC配置 MCLK/采样率=256 */
+    ret_val |= es8388_write_reg(0x10, 0x00);    /* ADC数字音量控制将信号衰减 L  设置为最小！！！ */
+    ret_val |= es8388_write_reg(0x11, 0x00);    /* ADC数字音量控制将信号衰减 R  设置为最小！！！ */
+
+    ret_val |= es8388_write_reg(0x17, 0x18);    /* DAC音频数据为16bit */
+    ret_val |= es8388_write_reg(0x18, 0x02);    /* DAC配置 MCLK/采样率=256 */
+    ret_val |= es8388_write_reg(0x1A, 0x00);    /* DAC数字音量控制将信号衰减 L  设置为最小！！！ */
+    ret_val |= es8388_write_reg(0x1B, 0x00);    /* DAC数字音量控制将信号衰减 R  设置为最小！！！ */
+    ret_val |= es8388_write_reg(0x27, 0xB8);    /* L混频器 */
+    ret_val |= es8388_write_reg(0x2A, 0xB8);    /* R混频器 */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    if (ret_val != ESP_OK)
+    {
+        ESP_LOGI(es8388_tag, "ES8388 fail");
+        return 1;
     }
-}
-
-/**
- * @brief 向ES8388指定寄存器写入数据（使用默认地址）
- * 
- * @param reg_add 寄存器地址
- * @param data 要写入的数据
- * @return esp_err_t 操作结果
- */
-esp_err_t es8388_write_reg(uint8_t reg_add, uint8_t data)
-{
-    return es_write_reg(ES8388_ADDR, reg_add, data);
-}
-
-/**
- * @brief 配置ES8388的ADC和DAC音量（可视为增益）
- * 
- * @param mode 配置模式：ADC、DAC或两者
- * @param volume 音量值（-96 ~ 0）
- * @param dot 是否包含0.5dB的精度
- * @return int 操作结果：0成功，-1参数错误
- */
-static int es8388_set_adc_dac_volume(int mode, int volume, int dot)
-{
-    int res = 0;
-    if ( volume < -96 || volume > 0 ) {  // 检查音量范围
-        ESP_LOGW(ES_TAG, "警告: 音量 < -96 或 > 0!\n");
-        if (volume < -96)
-            volume = -96;
-        else
-            volume = 0;
+    else
+    {
+        ESP_LOGI(es8388_tag, "ES8388 success");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        return 0;
     }
-    dot = (dot >= 5 ? 1 : 0);  // 处理0.5dB精度
-    volume = (-volume << 1) + dot;  // 转换为寄存器值
+
+    es8388_adda_cfg(0, 0);      /* 开启DAC关闭ADC */
+    es8388_input_cfg(0);        /* 关闭录音输入 */
+    es8388_output_cfg(0, 0);    /* DAC选择通道输出 */
+    es8388_hpvol_set(0);        /* 设置耳机音量 */
+    es8388_spkvol_set(0);       /* 设置喇叭音量 */
     
-    // 根据模式配置相应寄存器
-    if (mode == ES_MODULE_ADC || mode == ES_MODULE_ADC_DAC) {
-        res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL8, volume);
-        res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL9, volume);  // ADC右声道音量=0dB
-    }
-    if (mode == ES_MODULE_DAC || mode == ES_MODULE_ADC_DAC) {
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL5, volume);
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL4, volume);
-    }
-    return res;
-}
-
-
-/**
- * @brief 电源管理（启动模块）
- * 
- * @param mode 要启动的模块
- * @return esp_err_t 操作结果
- */
-esp_err_t es8388_start(es_module_t mode)
-{
-    esp_err_t res = ESP_OK;
-    uint8_t prev_data = 0, data = 0;
-    es_read_reg(ES8388_DACCONTROL21, &prev_data);
-    
-    if (mode == ES_MODULE_LINE) {  // 线路输入模式
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL16, 0x09); // 0x00:音频来自LIN1&RIN1, 0x09:LIN2&RIN2直通使能
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL17, 0x50); // 左DAC到左混音器使能，LIN信号到左混音器使能（0dB）
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL20, 0x50); // 右DAC到右混音器使能，LIN信号到右混音器使能（0dB）
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL21, 0xC0); // 使能ADC
-    } else {
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL21, 0x80);   // 使能DAC
-    }
-    
-    es_read_reg(ES8388_DACCONTROL21, &data);
-    if (prev_data != data) {  // 寄存器值变化时启动状态机
-        res |= es_write_reg(ES8388_ADDR, ES8388_CHIPPOWER, 0xF0);   // 启动状态机
-        res |= es_write_reg(ES8388_ADDR, ES8388_CHIPPOWER, 0x00);   // 启动状态机
-    }
-    
-    // 根据模式启动相应模块电源
-    if (mode == ES_MODULE_ADC || mode == ES_MODULE_ADC_DAC || mode == ES_MODULE_LINE) {
-        res |= es_write_reg(ES8388_ADDR, ES8388_ADCPOWER, 0x00);   // 上电ADC和线路输入
-    }
-    if (mode == ES_MODULE_DAC || mode == ES_MODULE_ADC_DAC || mode == ES_MODULE_LINE) {
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACPOWER, 0x3c);   // 上电DAC和线路输出
-        res |= es8388_set_voice_mute(false);  // 取消静音
-        ESP_LOGD(ES_TAG, "es8388启动，模式:%d", mode);
-    }
-
-    return res;
+    return 0;
 }
 
 /**
- * @brief 电源管理（停止模块）
- * 
- * @param mode 要停止的模块
- * @return esp_err_t 操作结果
- */
-esp_err_t es8388_stop(es_module_t mode)
-{
-    esp_err_t res = ESP_OK;
-    if (mode == ES_MODULE_LINE) {  // 线路输入模式停止
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL21, 0x80); // 使能DAC
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL16, 0x00); // 音频来自LIN1&RIN1
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL17, 0x90); // 仅左DAC到左混音器使能（0dB）
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL20, 0x90); // 仅右DAC到右混音器使能（0dB）
-        return res;
-    }
-    
-    // 根据模式停止相应模块电源
-    if (mode == ES_MODULE_DAC || mode == ES_MODULE_ADC_DAC) {
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACPOWER, 0x00);
-        res |= es8388_set_voice_mute(true);  // 静音
-    }
-    if (mode == ES_MODULE_ADC || mode == ES_MODULE_ADC_DAC) {
-        res |= es_write_reg(ES8388_ADDR, ES8388_ADCPOWER, 0xFF);  // 下电ADC和线路输入
-    }
-    if (mode == ES_MODULE_ADC_DAC) {
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL21, 0x9C);  // 禁用主时钟
-    }
-
-    return res;
-}
-
-
-/**
- * @brief 配置主模式下的I2S时钟
- * 
- * @param cfg 时钟配置（包括SCLK和LCLK分频）
- * @return esp_err_t 操作结果
- */
-esp_err_t es8388_i2s_config_clock(es_i2s_clock_t cfg)
-{
-    esp_err_t res = ESP_OK;
-    res |= es_write_reg(ES8388_ADDR, ES8388_MASTERMODE, cfg.sclk_div);  // 配置SCLK分频
-    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL5, cfg.lclk_div);  // ADC时钟模式配置
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL2, cfg.lclk_div);  // DAC时钟模式配置
-    return res;
-}
-
-/**
- * @brief 反初始化ES8388
- * 
- * @return esp_err_t 操作结果
+ * @brief       ES8388反初始化
+ * @param       无
+ * @retval      0,初始化正常
+ *              其他,错误代码
  */
 esp_err_t es8388_deinit(void)
 {
-    int res = 0;
-    res = es_write_reg(ES8388_ADDR, ES8388_CHIPPOWER, 0xFF);  // 重置并停止ES8388
-    i2c_bus_delete(i2c_handle);  // 删除I2C总线
-    
-#ifdef CONFIG_ESP_LYRAT_V4_3_BOARD
-    headphone_detect_deinit();  // 耳机检测反初始化
-#endif
-
-    audio_codec_volume_deinit(dac_vol_handle);  // 音量控制反初始化
-    return res;
+    return es8388_write_reg(0x02, 0xFF);    /* 复位和暂停ES8388 */
 }
 
 /**
- * @brief 初始化ES8388编解码器
- * 
- * @param cfg 初始化配置
- * @return esp_err_t 操作结果：0成功，-1失败
+ * @brief       设置ES8388工作模式
+ * @param       fmt : 工作模式
+ *    @arg      0, 飞利浦标准I2S;
+ *    @arg      1, MSB(左对齐);
+ *    @arg      2, LSB(右对齐);
+ *    @arg      3, PCM/DSP
+ * @param       len : 数据长度
+ *    @arg      0, 24bit
+ *    @arg      1, 20bit
+ *    @arg      2, 18bit
+ *    @arg      3, 16bit
+ *    @arg      4, 32bit
+ * @retval      无
  */
-esp_err_t es8388_init(audio_hal_codec_config_t *cfg)
+void es8388_i2s_cfg(uint8_t fmt, uint8_t len)
 {
-    int res = 0;
-#ifdef CONFIG_ESP_LYRAT_V4_3_BOARD
-    headphone_detect_init(get_headphone_detect_gpio());  // 耳机检测初始化
-#endif  /* CONFIG_ESP_LYRAT_V4_3_BOARD */
-
-    res = i2c_init();  // 初始化I2C（ESP32为主模式）
-
-    // 初始化寄存器配置
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL3, 0x04);  // 禁用DAC静音和软斜坡
-    
-    /* 芯片控制和电源管理 */
-    res |= es_write_reg(ES8388_ADDR, ES8388_CONTROL2, 0x50);
-    res |= es_write_reg(ES8388_ADDR, ES8388_CHIPPOWER, 0x00);  // 正常模式，所有模块上电
-
-    // 禁用内部DLL以改善8K采样率性能
-    res |= es_write_reg(ES8388_ADDR, 0x35, 0xA0);
-    res |= es_write_reg(ES8388_ADDR, 0x37, 0xD0);
-    res |= es_write_reg(ES8388_ADDR, 0x39, 0xD0);
-
-    res |= es_write_reg(ES8388_ADDR, ES8388_MASTERMODE, cfg->i2s_iface.mode);  // CODEC工作在I2S从模式
-
-    /* DAC配置 */
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACPOWER, 0xC0);  // 禁用DAC和输出
-    res |= es_write_reg(ES8388_ADDR, ES8388_CONTROL1, 0x12);  // 播放和录制模式
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL1, 0x18);   // 16位I2S格式
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL2, 0x02);   // DAC单速模式，比率256
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL16, 0x00);  // 音频来自LIN1&RIN1
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL17, 0x90);  // 仅左DAC到左混音器使能（0dB）
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL20, 0x90);  // 仅右DAC到右混音器使能（0dB）
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL21, 0x80);  // ADC和DAC使用相同的LRCK时钟
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL23, 0x00);  // vroi=0
-
-    // 设置输出音量（0dB）
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL24, 0x1E);
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL25, 0x1E);
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL26, 0);
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL27, 0);
-    
-    // 根据配置设置DAC输出通道
-    int tmp = 0;
-    if (AUDIO_HAL_DAC_OUTPUT_LINE2 == cfg->dac_output) {
-        tmp = DAC_OUTPUT_LOUT1 | DAC_OUTPUT_ROUT1;
-    } else if (AUDIO_HAL_DAC_OUTPUT_LINE1 == cfg->dac_output) {
-        tmp = DAC_OUTPUT_LOUT2 | DAC_OUTPUT_ROUT2;
-    } else {
-        tmp = DAC_OUTPUT_LOUT1 | DAC_OUTPUT_LOUT2 | DAC_OUTPUT_ROUT1 | DAC_OUTPUT_ROUT2;
-    }
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACPOWER, tmp);  // 使能DAC和相应输出
-
-    /* ADC配置 */
-    res |= es_write_reg(ES8388_ADDR, ES8388_ADCPOWER, 0xFF);  // 初始下电ADC
-    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL1, 0xbb);  // MIC左右声道PGA增益
-    
-    // 根据配置设置ADC输入通道
-    tmp = 0;
-    if (AUDIO_HAL_ADC_INPUT_LINE1 == cfg->adc_input) {
-        tmp = ADC_INPUT_LINPUT1_RINPUT1;
-    } else if (AUDIO_HAL_ADC_INPUT_LINE2 == cfg->adc_input) {
-        tmp = ADC_INPUT_LINPUT2_RINPUT2;
-    } else {
-        tmp = ADC_INPUT_DIFFERENCE;
-    }
-    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL2, tmp);  // 设置ADC输入源
-    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL3, 0x02);
-    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL4, 0x0c);  // 16位I2S格式
-    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL5, 0x02);  // ADC单速模式，比率256
-    
-    // 麦克风自动增益控制
-    res |= es8388_set_adc_dac_volume(ES_MODULE_ADC, 0, 0);    // 0dB
-    res |= es_write_reg(ES8388_ADDR, ES8388_ADCPOWER, 0x09);  // 上电ADC，使能LIN&RIN
-
-    /* 配置ES8388功率放大器GPIO */
-    if (get_pa_enable_gpio() != -1) {
-        gpio_config_t io_conf;
-        memset(&io_conf, 0, sizeof(io_conf));
-        io_conf.mode = GPIO_MODE_OUTPUT;
-        io_conf.pin_bit_mask = BIT64(get_pa_enable_gpio());
-        io_conf.pull_down_en = 0;
-        io_conf.pull_up_en = 0;
-        gpio_config(&io_conf);
-        /* 使能ES8388功率放大器 */
-        es8388_pa_power(true);
-    }
-
-    // 初始化DAC音量控制
-    codec_dac_volume_config_t vol_cfg = ES8388_DAC_VOL_CFG_DEFAULT();
-    dac_vol_handle = audio_codec_volume_init(&vol_cfg);
-    ESP_LOGI(ES_TAG, "初始化完成,输出:%02x, 输入:%02x", cfg->dac_output, cfg->adc_input);
-    return res;
+    fmt &= 0x03;
+    len &= 0x07;    /* 限定范围 */
+    es8388_write_reg(23, (fmt << 1) | (len << 3));  /* R23,ES8388工作模式设置 */
 }
 
 /**
- * @brief 配置ES8388的I2S格式
- * 
- * @param mode 配置模式：ADC、DAC或两者
- * @param fmt I2S格式
- * @return esp_err_t 操作结果
+ * @brief       设置耳机音量
+ * @param       volume : 音量大小(0 ~ 33)
+ * @retval      无
  */
-esp_err_t es8388_config_fmt(es_module_t mode, es_i2s_fmt_t fmt)
+void es8388_hpvol_set(uint8_t volume)
 {
-    esp_err_t res = ESP_OK;
-    uint8_t reg = 0;
-    
-    // 配置ADC的I2S格式
-    if (mode == ES_MODULE_ADC || mode == ES_MODULE_ADC_DAC) {
-        res = es_read_reg(ES8388_ADCCONTROL4, &reg);
-        reg = reg & 0xfc;  // 清除低2位
-        res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL4, reg | fmt);
+    if (volume > 33)
+    {
+        volume = 33;
     }
-    
-    // 配置DAC的I2S格式
-    if (mode == ES_MODULE_DAC || mode == ES_MODULE_ADC_DAC) {
-        res = es_read_reg(ES8388_DACCONTROL1, &reg);
-        reg = reg & 0xf9;  // 清除特定位
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL1, reg | (fmt << 1));
-    }
-    return res;
+
+    es8388_write_reg(0x2E, volume);
+    es8388_write_reg(0x2F, volume);
 }
 
 /**
- * @brief 设置音量
- * 
- * @note 寄存器值：0xC0=-96dB, 0x64=-50dB, 0x00=0dB
- * @note 增益精度为0.5dB
- * @param volume 音量值（0~100）
- * @return esp_err_t 操作结果
+ * @brief       设置喇叭音量
+ * @param       volume : 音量大小(0 ~ 33)
+ * @retval      无
  */
-esp_err_t es8388_set_voice_volume(int volume)
+void es8388_spkvol_set(uint8_t volume)
 {
-    esp_err_t res = ESP_OK;
-    uint8_t reg = 0;
-    reg = audio_codec_get_dac_reg_value(dac_vol_handle, volume);  // 获取寄存器值
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL5, reg);
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL4, reg);
-    ESP_LOGD(ES_TAG, "设置音量:%.2d 寄存器值:0x%.2x 分贝:%.1f", 
-            (int)dac_vol_handle->user_volume, reg,
-            audio_codec_cal_dac_volume(dac_vol_handle));
-    return res;
-}
-
-/**
- * @brief 获取当前音量
- * 
- * @param[out] *volume 音量值（0~100）
- * @return esp_err_t 操作结果
- */
-esp_err_t es8388_get_voice_volume(int *volume)
-{
-    esp_err_t res = ESP_OK;
-    uint8_t reg = 0;
-    res = es_read_reg(ES8388_DACCONTROL4, &reg);  // 读取寄存器值
-    if (res == ESP_FAIL) {
-        *volume = 0;
-    } else {
-        if (reg == dac_vol_handle->reg_value) {
-            *volume = dac_vol_handle->user_volume;
-        } else {
-            *volume = 0;
-            res = ESP_FAIL;
-        }
+    if (volume > 33)
+    {
+        volume = 33;
     }
-    ESP_LOGD(ES_TAG, "获取音量:%.2d 寄存器值:0x%.2x", *volume, reg);
-    return res;
+
+    es8388_write_reg(0x30, volume);
+    es8388_write_reg(0x31, volume);
 }
 
 /**
- * @brief 配置ES8388的数据采样位数
- * 
- * @param mode 配置模式：ADC、DAC或两者
- * @param bits_length 采样位数
- * @return esp_err_t 操作结果
+ * @brief       设置3D环绕声
+ * @param       depth : 0 ~ 7(3D强度,0关闭,7最强)
+ * @retval      无
  */
-esp_err_t es8388_set_bits_per_sample(es_module_t mode, es_bits_length_t bits_length)
+void es8388_3d_set(uint8_t depth)
 {
-    esp_err_t res = ESP_OK;
-    uint8_t reg = 0;
-    int bits = (int)bits_length;
-
-    // 配置ADC采样位数
-    if (mode == ES_MODULE_ADC || mode == ES_MODULE_ADC_DAC) {
-        res = es_read_reg(ES8388_ADCCONTROL4, &reg);
-        reg = reg & 0xe3;  // 清除相关位
-        res |=  es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL4, reg | (bits << 2));
-    }
-    
-    // 配置DAC采样位数
-    if (mode == ES_MODULE_DAC || mode == ES_MODULE_ADC_DAC) {
-        res = es_read_reg(ES8388_DACCONTROL1, &reg);
-        reg = reg & 0xc7;  // 清除相关位
-        res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL1, reg | (bits << 3));
-    }
-    return res;
+    depth &= 0x7;       /* 限定范围 */
+    es8388_write_reg(0x1D, depth << 2);    /* R7,3D环绕设置 */
 }
 
 /**
- * @brief 配置ES8388的DAC静音状态
- * 
- * @param enable true:静音, false:取消静音
- * @return esp_err_t 操作结果
+ * @brief       ES8388 DAC/ADC配置
+ * @param       dacen : dac使能(1) / 关闭(0)
+ * @param       adcen : adc使能(1) / 关闭(0)
+ * @retval      无
  */
-esp_err_t es8388_set_voice_mute(bool enable)
+void es8388_adda_cfg(uint8_t dacen, uint8_t adcen)
 {
-    esp_err_t res = ESP_OK;
-    uint8_t reg = 0;
-    res = es_read_reg(ES8388_DACCONTROL3, &reg);
-    reg = reg & 0xFB;  // 清除静音位
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACCONTROL3, reg | (((int)enable) << 2));
-    return res;
+    uint8_t tempreg = 0;
+
+    tempreg |= !dacen << 0;
+    tempreg |= !adcen << 1;
+    tempreg |= !dacen << 2;
+    tempreg |= !adcen << 3;
+    es8388_write_reg(0x02, tempreg);
 }
 
 /**
- * @brief 获取ES8388的DAC静音状态
- * 
- * @return 0:未静音, 1:静音, 其他:错误
+ * @brief       ES8388 DAC输出通道配置
+ * @param       o1en : 通道1使能(1)/禁止(0)
+ * @param       o2en : 通道2使能(1)/禁止(0)
+ * @retval      无
  */
-esp_err_t es8388_get_voice_mute(void)
+void es8388_output_cfg(uint8_t o1en, uint8_t o2en)
 {
-    esp_err_t res = ESP_OK;
-    uint8_t reg = 0;
-    res = es_read_reg(ES8388_DACCONTROL3, &reg);
-    if (res == ESP_OK) {
-        reg = (reg & 0x04) >> 2;  // 提取静音位
-    }
-    return res == ESP_OK ? reg : res;
+    uint8_t tempreg = 0;
+    tempreg |= o1en * (3 << 4);
+    tempreg |= o2en * (3 << 2);
+    es8388_write_reg(0x04, tempreg);
 }
 
 /**
- * @brief 配置DAC输出
- * 
- * @param output 输出模式
- * @return esp_err_t 操作结果
+ * @brief       ES8388 MIC增益设置(MIC PGA增益)
+ * @param       gain : 0~8, 对应0~24dB  3dB/Step
+ * @retval      无
  */
-esp_err_t es8388_config_dac_output(es_dac_output_t output)
+void es8388_mic_gain(uint8_t gain)
 {
-    esp_err_t res;
-    uint8_t reg = 0;
-    res = es_read_reg(ES8388_DACPOWER, &reg);
-    reg = reg & 0xc3;  // 清除输出配置位
-    res |= es_write_reg(ES8388_ADDR, ES8388_DACPOWER, reg | output);
-    return res;
+    gain &= 0x0F;
+    gain |= gain << 4;
+    es8388_write_reg(0x09, gain);       /* R9,左右通道PGA增益设置 */
 }
 
 /**
- * @brief 配置ADC输入
- * 
- * @param input 输入模式
- * @return esp_err_t 操作结果
+ * @brief       ES8388 ALC设置
+ * @param       sel
+ *   @arg       0,关闭ALC
+ *   @arg       1,右通道ALC
+ *   @arg       2,左通道ALC
+ *   @arg       3,立体声ALC
+ * @param       maxgain : 0~7,对应-6.5~+35.5dB
+ * @param       minigain: 0~7,对应-12~+30dB 6dB/STEP
+ * @retval      无
  */
-esp_err_t es8388_config_adc_input(es_adc_input_t input)
+void es8388_alc_ctrl(uint8_t sel, uint8_t maxgain, uint8_t mingain)
 {
-    esp_err_t res;
-    uint8_t reg = 0;
-    res = es_read_reg(ES8388_ADCCONTROL2, &reg);
-    reg = reg & 0x0f;  // 清除输入配置位
-    res |= es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL2, reg | input);
-    return res;
+    uint8_t tempreg = 0;
+    tempreg = sel << 6;
+    tempreg |= (maxgain & 0x07) << 3;
+    tempreg |= mingain & 0x07;
+    es8388_write_reg(0x12, tempreg);     /* R18,ALC设置 */
 }
 
 /**
- * @brief 设置麦克风增益
- * 
- * @param gain 增益值（es_mic_gain_t类型）
- * @return esp_err_t 操作结果
+ * @brief       ES8388 ADC输出通道配置
+ * @param       in : 输入通道
+ *    @arg      0, 通道1输入
+ *    @arg      1, 通道2输入
+ * @retval      无
  */
-esp_err_t es8388_set_mic_gain(es_mic_gain_t gain)
+void es8388_input_cfg(uint8_t in)
 {
-    esp_err_t res, gain_n;
-    gain_n = (int)gain / 3;
-    gain_n = (gain_n << 4) + gain_n;  // 转换为寄存器值
-    res = es_write_reg(ES8388_ADDR, ES8388_ADCCONTROL1, gain_n); // 设置MIC PGA增益
-    return res;
-}
-
-/**
- * @brief 控制ES8388编解码器状态
- * 
- * @param mode 编解码器模式
- * @param ctrl_state 控制状态（启动/停止）
- * @return int 操作结果
- */
-int es8388_ctrl_state(audio_hal_codec_mode_t mode, audio_hal_ctrl_t ctrl_state)
-{
-    int res = 0;
-    int es_mode_t = 0;
-    
-    // 转换编解码器模式
-    switch (mode) {
-        case AUDIO_HAL_CODEC_MODE_ENCODE:
-            es_mode_t  = ES_MODULE_ADC;
-            break;
-        case AUDIO_HAL_CODEC_MODE_LINE_IN:
-            es_mode_t  = ES_MODULE_LINE;
-            break;
-        case AUDIO_HAL_CODEC_MODE_DECODE:
-            es_mode_t  = ES_MODULE_DAC;
-            break;
-        case AUDIO_HAL_CODEC_MODE_BOTH:
-            es_mode_t  = ES_MODULE_ADC_DAC;
-            break;
-        default:
-            es_mode_t = ES_MODULE_DAC;
-            ESP_LOGW(ES_TAG, "不支持的编解码器模式，默认使用解码模式");
-            break;
-    }
-    
-    // 根据控制状态启动或停止
-    if (AUDIO_HAL_CTRL_STOP == ctrl_state) {
-        res = es8388_stop(es_mode_t);
-    } else {
-        res = es8388_start(es_mode_t);
-        ESP_LOGD(ES_TAG, "启动默认解码模式:%d", es_mode_t);
-    }
-    return res;
-}
-
-/**
- * @brief 配置ES8388的I2S接口
- * 
- * @param mode 编解码器模式
- * @param iface I2S接口配置
- * @return esp_err_t 操作结果
- */
-esp_err_t es8388_config_i2s(audio_hal_codec_mode_t mode, audio_hal_codec_i2s_iface_t *iface)
-{
-    esp_err_t res = ESP_OK;
-    int tmp = 0;
-    res |= es8388_config_fmt(ES_MODULE_ADC_DAC, iface->fmt);  // 配置I2S格式
-    
-    // 配置采样位数
-    if (iface->bits == AUDIO_HAL_BIT_LENGTH_16BITS) {
-        tmp = BIT_LENGTH_16BITS;
-    } else if (iface->bits == AUDIO_HAL_BIT_LENGTH_24BITS) {
-        tmp = BIT_LENGTH_24BITS;
-    } else {
-        tmp = BIT_LENGTH_32BITS;
-    }
-    res |= es8388_set_bits_per_sample(ES_MODULE_ADC_DAC, tmp);
-    return res;
-}
-
-/**
- * @brief 控制ES8388的功率放大器
- * 
- * @param enable true:使能PA, false:禁用PA
- * @return esp_err_t 操作结果
- */
-esp_err_t es8388_pa_power(bool enable)
-{
-    esp_err_t res = ESP_OK;
-    if (get_pa_enable_gpio() == -1) {
-        return res;
-    }
-    if (enable) {
-        res = gpio_set_level(get_pa_enable_gpio(), 1);  // 使能PA
-    } else {
-        res = gpio_set_level(get_pa_enable_gpio(), 0);  // 禁用PA
-    }
-    return res;
+    es8388_write_reg(0x0A, (5 * in) << 4);   /* ADC1 输入通道选择L/R INPUT1 */
 }
